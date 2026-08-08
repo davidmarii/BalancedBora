@@ -1,17 +1,18 @@
 # ============================================================
-# BALANCEDBORA — COMPLETE PRODUCTION BOT v2.6
-# Features: NRC 2001 LP + Best-Effort Mode + 21 Feeds + Image
-# + Native Translations (English, Swahili, Kikuyu, Kimeru)
-# + Optional AI Translations (OpenAI)
-# NO API DEPENDENCY — works offline, instant, forever
+# BALANCEDBORA v3.0 — RATION + SUPPLIERS + M-PESA + ADMIN
+# Features: NRC 2001, 21 Feeds, 4 Languages, Supplier Directory,
+# M-Pesa STK Push, Admin Dashboard, Image Recognition
 # ============================================================
 
 import os
-import requests
+import json
 import base64
+import hashlib
 import traceback
+import requests
+from datetime import datetime
 from fastapi import FastAPI, Form, Request
-from fastapi.responses import Response
+from fastapi.responses import Response, HTMLResponse
 from fastapi.staticfiles import StaticFiles
 from twilio.rest import Client
 from twilio.twiml.messaging_response import MessagingResponse
@@ -20,7 +21,7 @@ import pulp
 from dotenv import load_dotenv
 load_dotenv()
 
-app = FastAPI(title="BalancedBora Complete Bot")
+app = FastAPI(title="BalancedBora v3.0")
 os.makedirs("static", exist_ok=True)
 app.mount("/static", StaticFiles(directory="static"), name="static")
 
@@ -31,20 +32,67 @@ TWILIO_SID = os.getenv("TWILIO_ACCOUNT_SID", "")
 TWILIO_TOKEN = os.getenv("TWILIO_AUTH_TOKEN", "")
 TWILIO_NUMBER = os.getenv("TWILIO_PHONE_NUMBER", "whatsapp:+254703709346")
 GOOGLE_API_KEY = os.getenv("GOOGLE_VISION_API_KEY", "")
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")  # Optional: enables AI translations
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
+
+# M-Pesa Daraja API
+MPESA_CONSUMER_KEY = os.getenv("MPESA_CONSUMER_KEY", "")
+MPESA_CONSUMER_SECRET = os.getenv("MPESA_CONSUMER_SECRET", "")
+MPESA_SHORTCODE = os.getenv("MPESA_SHORTCODE", "174379")  # Sandbox default
+MPESA_PASSKEY = os.getenv("MPESA_PASSKEY", "")
+MPESA_ENV = os.getenv("MPESA_ENV", "sandbox")  # sandbox or production
+BASE_URL = os.getenv("BASE_URL", "")  # e.g. https://balancedbora.onrender.com
 
 client = Client(TWILIO_SID, TWILIO_TOKEN) if TWILIO_SID else None
 
 # ============================================================
-# SESSIONS
+# SESSIONS & ORDERS
 # ============================================================
 user_sessions = {}
+orders_db = {}  # phone -> list of orders
+
+# ============================================================
+# SUPPLIER DATABASE (JSON-backed)
+# ============================================================
+SUPPLIERS_FILE = "suppliers.json"
+
+def load_suppliers():
+    if os.path.exists(SUPPLIERS_FILE):
+        with open(SUPPLIERS_FILE, "r", encoding="utf-8") as f:
+            return json.load(f)
+    return {
+        "maize_bran": [
+            {"id": "sup_001", "name": "Central Feeds Ltd", "phone": "+254712345678", "region": "Central", "price": 24}
+        ],
+        "wheat_bran": [
+            {"id": "sup_002", "name": "Nakuru Grain Hub", "phone": "+254723456789", "region": "Rift Valley", "price": 19}
+        ],
+        "cottonseed_cake": [
+            {"id": "sup_003", "name": "Eldoret Protein Co", "phone": "+254734567890", "region": "Rift Valley", "price": 58}
+        ],
+        "napier_grass_fresh": [
+            {"id": "sup_004", "name": "Green Pastures Co-op", "phone": "+254745678901", "region": "Central", "price": 4}
+        ],
+        "soybean_meal": [
+            {"id": "sup_005", "name": "Nairobi Agro Suppliers", "phone": "+254756789012", "region": "Nairobi", "price": 72}
+        ],
+        "dairy_meal_18": [
+            {"id": "sup_006", "name": "Unga Feeds Distributor", "phone": "+254767890123", "region": "Central", "price": 53}
+        ],
+        "limestone": [
+            {"id": "sup_007", "name": "Mineral Solutions KE", "phone": "+254778901234", "region": "Nairobi", "price": 14}
+        ],
+    }
+
+def save_suppliers(data):
+    with open(SUPPLIERS_FILE, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2, ensure_ascii=False)
+
+SUPPLIERS_DB = load_suppliers()
 
 # ============================================================
 # OPTIONAL AI TRANSLATION ENGINE
 # ============================================================
 def ai_translate(text, target_lang):
-    """Translate text using OpenAI if API key is available. Otherwise return None."""
     if not OPENAI_API_KEY:
         return None
     try:
@@ -65,15 +113,20 @@ def ai_translate(text, target_lang):
         return None
 
 # ============================================================
-# NATIVE TRANSLATION SYSTEM — NO API NEEDED
+# NATIVE TRANSLATION SYSTEM
 # ============================================================
 LANG_MAP = {'1': 'en', '2': 'sw', '3': 'ki', '4': 'mer'}
 LANG_NAME = {'en': 'English', 'sw': 'Kiswahili', 'ki': 'Kikuyu', 'mer': 'Kimeru'}
+REGIONS = {
+    '1': 'Central', '2': 'Rift Valley', '3': 'Eastern', '4': 'Nairobi',
+    '5': 'Western', '6': 'Nyanza', '7': 'Coast', '8': 'North Eastern'
+}
 
 MESSAGES = {
     'en': {
         'welcome': "🐄 Welcome to BalancedBora!\n\nI calculate the cheapest balanced ration for your cow using NRC 2001 science.",
         'choose_language': "🌍 Choose your language:\n\n1️⃣ English\n2️⃣ Kiswahili\n3️⃣ Kikuyu\n4️⃣ Kimeru\n\nReply with 1, 2, 3, or 4.",
+        'choose_region': "🌍 Choose your region:\n\n1️⃣ Central\n2️⃣ Rift Valley\n3️⃣ Eastern\n4️⃣ Nairobi\n5️⃣ Western\n6️⃣ Nyanza\n7️⃣ Coast\n8️⃣ North Eastern\n\nReply with a number (1-8) or 0 to skip.",
         'choose_animal': "Step 1: Choose your animal by number:\n\n1️⃣ Dairy Cow — High Producer (30L/day)\n2️⃣ Dairy Cow — Medium Producer (20L/day)\n3️⃣ Dairy Cow — Low Producer (10L/day)\n4️⃣ Dry Cow (Late Pregnancy)\n5️⃣ Growing Heifer (300kg)\n\nReply with a number (1-5).",
         'feed_selection': "Step 2: Which feeds do you have?\nSend numbers separated by commas (e.g., 1,6,11,16,18):\n\nENERGY:\n1️⃣ Maize Bran (KES 25/kg)\n2️⃣ Wheat Bran (KES 20/kg)\n3️⃣ Rice Bran (KES 22/kg)\n4️⃣ Cassava Chips (KES 18/kg)\n5️⃣ Molasses (KES 30/kg)\n\nPROTEIN:\n6️⃣ Cottonseed Cake (KES 60/kg)\n7️⃣ Sunflower Cake (KES 55/kg)\n8️⃣ Soybean Meal (KES 75/kg)\n9️⃣ Brewers Grains (KES 15/kg)\n🔟 Fish Meal (KES 120/kg)\n\nFORAGE:\n11️⃣ Napier Grass Fresh (KES 5/kg)\n12️⃣ Napier Grass Silage (KES 8/kg)\n13️⃣ Maize Stover (KES 3/kg)\n14️⃣ Rhodes Grass Hay (KES 10/kg)\n15️⃣ Lucerne Hay (KES 35/kg)\n\nCONCENTRATE:\n16️⃣ Dairy Meal 18% (KES 55/kg)\n17️⃣ Dairy Meal 24% (KES 65/kg)\n\nMINERALS:\n18️⃣ Limestone (KES 15/kg)\n19️⃣ Dicalcium Phosphate (KES 80/kg)\n20️⃣ Mineral Lick (KES 50/kg)\n21️⃣ Salt (KES 20/kg)\n\nTip: Include at least 1 forage + 1 protein source.",
         'ration_optimal': "✅ Your Balanced Ration (NRC 2001)",
@@ -103,10 +156,22 @@ MESSAGES = {
         'kg_day': "kg/day",
         'kes_day': "KES",
         'notes_header': "NOTES:",
+        'supplier_header': "💼 SUPPLIERS NEAR YOU:",
+        'no_supplier': "No registered suppliers yet. Ask your local agrovet.",
+        'order_prompt': "\n📦 Reply ORDER to buy these feeds from suppliers.",
+        'order_instructions': "Reply with amounts like: 1:5,2:3\n(This means 5kg of feed #1 and 3kg of feed #2 from your ration)",
+        'order_invalid': "❌ Invalid format. Use: 1:5,2:3 (feed_number:kg)",
+        'order_summary': "📦 ORDER SUMMARY\n\n{items}\nTotal: *KES {total}*\n\nReply with your M-Pesa number to pay.",
+        'payment_prompt': "📲 Enter M-Pesa number (e.g. 254712345678):",
+        'payment_initiated': "✅ M-Pesa prompt sent to {phone}.\nEnter PIN on your phone to complete payment.",
+        'payment_failed': "❌ Payment failed: {reason}\nPlease try again or pay supplier directly.",
+        'payment_success': "✅ Payment received!\nSupplier {supplier} will contact you on {phone} for delivery.",
+        'mpesa_not_configured': "⚠️ M-Pesa not configured yet.\nCall supplier directly: {phone}",
     },
     'sw': {
         'welcome': "🐄 Karibu BalancedBora!\n\nNakuhesabu chakula bora kwa gharama nafuu kwa ng'ombe wako kwa kutumia sayansi ya NRC 2001.",
         'choose_language': "🌍 Chagua lugha yako:\n\n1️⃣ English\n2️⃣ Kiswahili\n3️⃣ Kikuyu\n4️⃣ Kimeru\n\nJibu kwa 1, 2, 3, au 4.",
+        'choose_region': "🌍 Chagua mkoa wako:\n\n1️⃣ Central\n2️⃣ Rift Valley\n3️⃣ Eastern\n4️⃣ Nairobi\n5️⃣ Western\n6️⃣ Nyanza\n7️⃣ Coast\n8️⃣ North Eastern\n\nJibu kwa namba (1-8) au 0 ku-ruka.",
         'choose_animal': "Hatua 1: Chagua mnyama wako kwa namba:\n\n1️⃣ Ng'ombe wa Maziwa — Mzazi Mkubwa (L 30/siku)\n2️⃣ Ng'ombe wa Maziwa — Mzazi wa Kati (L 20/siku)\n3️⃣ Ng'ombe wa Maziwa — Mzazi Mdogo (L 10/siku)\n4️⃣ Ng'ombe wa Kavu (Mimba ya Mwisho)\n5️⃣ Mtoto Ng'ombe (kg 300)\n\nJibu kwa namba (1-5).",
         'feed_selection': "Hatua 2: Chagua chakula ulicho nacho.\nTuma namba zikitenganishwa na koma (mfano, 1,6,11,16,18):\n\nNISHATI:\n1️⃣ Makapi ya Mahindi (KES 25/kg)\n2️⃣ Makapi ya Ngano (KES 20/kg)\n3️⃣ Makapi ya Mchele (KES 22/kg)\n4️⃣ Vipande vya Muhogo (KES 18/kg)\n5️⃣ Mtambo (KES 30/kg)\n\nPROTEINI:\n6️⃣ Keki ya Pamba (KES 60/kg)\n7️⃣ Keki ya Alizeti (KES 55/kg)\n8️⃣ Mlo wa Soya (KES 75/kg)\n9️⃣ Makapi ya Bia (KES 15/kg)\n🔟 Mlo wa Samaki (KES 120/kg)\n\nMAJANI:\n11️⃣ Majani ya Napier Fresh (KES 5/kg)\n12️⃣ Majani ya Napier Silage (KES 8/kg)\n13️⃣ Majani ya Mahindi (KES 3/kg)\n14️⃣ Majani ya Rhodes Hay (KES 10/kg)\n15️⃣ Majani ya Lucerne (KES 35/kg)\n\nCHAKULA CHA KUKAMILISHA:\n16️⃣ Dairy Meal 18% (KES 55/kg)\n17️⃣ Dairy Meal 24% (KES 65/kg)\n\nMADINI:\n18️⃣ Mawe ya Chokaa (KES 15/kg)\n19️⃣ Dicalcium Phosphate (KES 80/kg)\n20️⃣ Chumvi ya Madini (KES 50/kg)\n21️⃣ Chumvi (KES 20/kg)\n\nKidokezo: Weka angalau majani 1 + chakula cha proteini 1.",
         'ration_optimal': "✅ Chakula Chako Bora (NRC 2001)",
@@ -136,10 +201,22 @@ MESSAGES = {
         'kg_day': "kg/siku",
         'kes_day': "KES",
         'notes_header': "MAELEZO:",
+        'supplier_header': "💼 WAUZAJI KARIBU NA WEWE:",
+        'no_supplier': "Hakuna wauzaji waliosajiliwa. Uliza agrovet yako.",
+        'order_prompt': "\n📦 Jibu ORDER kununua chakula kutoka kwa wauzaji.",
+        'order_instructions': "Jibu na kiasi kama: 1:5,2:3\n(Maana yake kg 5 za chakula #1 na kg 3 za chakula #2)",
+        'order_invalid': "❌ Umbizo sio sahihi. Tumia: 1:5,2:3 (namba_chakula:kg)",
+        'order_summary': "📦 MUHTASARI WA ORDER\n\n{items}\nJumla: *KES {total}*\n\nJibu na namba yako ya M-Pesa kulipa.",
+        'payment_prompt': "📲 Weka namba ya M-Pesa (mfano 254712345678):",
+        'payment_initiated': "✅ M-Pesa prompt imetumwa kwa {phone}.\nWeka PIN kwenye simu yako kukamilisha malipo.",
+        'payment_failed': "❌ Malipo yameshindwa: {reason}\nJaribu tena au lipa moja kwa moja kwa mchuuzi.",
+        'payment_success': "✅ Malipo yamepokelewa!\nMchuuzi {supplier} atawasiliana nawe kwa {phone} kwa delivery.",
+        'mpesa_not_configured': "⚠️ M-Pesa bado haijasanidiwa.\nPiga mchuuzi moja kwa moja: {phone}",
     },
     'ki': {
         'welcome': "🐄 Wî mwega BalancedBora!\n\nNîndîrathîrîria irio rîtheru na bei ncheene ya ng'ombe yaku na sayansi ya NRC 2001.",
         'choose_language': "🌍 Thagua rurimi rwaku:\n\n1️⃣ English\n2️⃣ Kiswahili\n3️⃣ Kikuyu\n4️⃣ Kimeru\n\nCokeria na 1, 2, 3, kana 4.",
+        'choose_region': "🌍 Thagua gîcigo gîaku:\n\n1️⃣ Central\n2️⃣ Rift Valley\n3️⃣ Eastern\n4️⃣ Nairobi\n5️⃣ Western\n6️⃣ Nyanza\n7️⃣ Coast\n8️⃣ North Eastern\n\nCokeria na namba (1-8) kana 0 kûrega.",
         'choose_animal': "Hatua 1: Thagua nyamû na namba:\n\n1️⃣ Ng'ombe ya Mûrû — Mûtûngi Mûnene (L 30/mûthenya)\n2️⃣ Ng'ombe ya Mûrû — Mûtûngi wa Gatagati (L 20/mûthenya)\n3️⃣ Ng'ombe ya Mûrû — Mûtûngi Mûnini (L 10/mûthenya)\n4️⃣ Ng'ombe Mûkûrû (Ndà Mûthî)\n5️⃣ Kîhîî kia Ng'ombe (kg 300)\n\nCokeria na namba (1-5).",
         'feed_selection': "Hatua 2: Thagua irio ûrî na rîo.\nTûma namba ikîmenyekanithio na koma (kûranî, 1,6,11,16,18):\n\nHOTI:\n1️⃣ Makapi ma Mûbî (KES 25/kg)\n2️⃣ Makapi ma Ngano (KES 20/kg)\n3️⃣ Makapi ma Mûchele (KES 22/kg)\n4️⃣ Muhogo (KES 18/kg)\n5️⃣ Mtambo (KES 30/kg)\n\nPROTEINI:\n6️⃣ Keki ya Pamba (KES 60/kg)\n7️⃣ Keki ya Alizeti (KES 55/kg)\n8️⃣ Mlo wa Soya (KES 75/kg)\n9️⃣ Makapi ma Bia (KES 15/kg)\n🔟 Mlo wa Thamaki (KES 120/kg)\n\nMAJANI:\n11️⃣ Majani ma Napier Fresh (KES 5/kg)\n12️⃣ Majani ma Napier Silage (KES 8/kg)\n13️⃣ Majani ma Mûbî (KES 3/kg)\n14️⃣ Majani ma Rhodes (KES 10/kg)\n15️⃣ Majani ma Lucerne (KES 35/kg)\n\nIRIO RÎA GÛCINIA:\n16️⃣ Dairy Meal 18% (KES 55/kg)\n17️⃣ Dairy Meal 24% (KES 65/kg)\n\nMADINI:\n18️⃣ Mawe ma Chokaa (KES 15/kg)\n19️⃣ Dicalcium Phosphate (KES 80/kg)\n20️⃣ Chumvi ya Madini (KES 50/kg)\n21️⃣ Chumvi (KES 20/kg)\n\nGîcûnio: Ikara majani 1 + irio rîa proteini 1.",
         'ration_optimal': "✅ Irio Rîaku Rîtheru (NRC 2001)",
@@ -169,10 +246,22 @@ MESSAGES = {
         'kg_day': "kg/mûthenya",
         'kes_day': "KES",
         'notes_header': "MAELEZO:",
+        'supplier_header': "💼 ARÎA MEKûGûRA HûGûRû:",
+        'no_supplier': "Gûtîrî arîa mekûgûra. Rîria agrovet yaku.",
+        'order_prompt': "\n📦 Cokeria ORDER kûgûra irio kuuma kûrîa mekûgûra.",
+        'order_instructions': "Cokeria na kîgîrô kîranî: 1:5,2:3\n(Maana yake kg 5 cia irio #1 na kg 3 cia irio #2)",
+        'order_invalid': "❌ Kîgîrô gîtarî kûrîa. Tumia: 1:5,2:3 (namba_irio:kg)",
+        'order_summary': "📦 MûTHONDO WA ORDER\n\n{items}\nJumla: *KES {total}*\n\nCokeria na namba yaku ya M-Pesa kûrîha.",
+        'payment_prompt': "📲 Ikara namba ya M-Pesa (kûranî 254712345678):",
+        'payment_initiated': "✅ M-Pesa prompt nîyatumîtwo kûrî {phone}.\nIkera PIN cîaku.",
+        'payment_failed': "❌ Kûrîha kûgîa gûtîrî: {reason}\nGeria rîngî kana ûrîhe mûgûrî mûciî.",
+        'payment_success': "✅ Kûrîha kwîmûkîrîrwo!\nMûgûrî {supplier} arîkûhûthia kûrî {phone}.",
+        'mpesa_not_configured': "⚠️ M-Pesa ndîrî na cîgerio.\nHîa mûgûrî mûciî: {phone}",
     },
     'mer': {
         'welcome': "🐄 Urova BalancedBora!\n\nNtathimana irio theru na bei ncheene ya ng'ombe yaku na sayansi ya NRC 2001.",
         'choose_language': "🌍 Thagua rurimi rwaku:\n\n1️⃣ English\n2️⃣ Kiswahili\n3️⃣ Kikuyu\n4️⃣ Kimeru\n\nCokeria na 1, 2, 3, kana 4.",
+        'choose_region': "🌍 Thagua gîcigo gîaku:\n\n1️⃣ Central\n2️⃣ Rift Valley\n3️⃣ Eastern\n4️⃣ Nairobi\n5️⃣ Western\n6️⃣ Nyanza\n7️⃣ Coast\n8️⃣ North Eastern\n\nCokeria na namba (1-8) kana 0 kûrega.",
         'choose_animal': "Hatua 1: Thagua kiama na namba:\n\n1️⃣ Ng'ombe ya Mûrû — Mûtûngi Mûnene (L 30/mûthenya)\n2️⃣ Ng'ombe ya Mûrû — Mûtûngi wa Gatagati (L 20/mûthenya)\n3️⃣ Ng'ombe ya Mûrû — Mûtûngi Mûnini (L 10/mûthenya)\n4️⃣ Ng'ombe Mûkûrû (Ndà Mûthî)\n5️⃣ Kîhîî kia Ng'ombe (kg 300)\n\nCokeria na namba (1-5).",
         'feed_selection': "Hatua 2: Thagua irio ûrî na rîo.\nTûma namba ikîmenyekanithio na koma (kûranî, 1,6,11,16,18):\n\nHOTI:\n1️⃣ Makapi ma Mûbî (KES 25/kg)\n2️⃣ Makapi ma Ngano (KES 20/kg)\n3️⃣ Makapi ma Mûchele (KES 22/kg)\n4️⃣ Muhogo (KES 18/kg)\n5️⃣ Mtambo (KES 30/kg)\n\nPROTEINI:\n6️⃣ Keki ya Pamba (KES 60/kg)\n7️⃣ Keki ya Alizeti (KES 55/kg)\n8️⃣ Mlo wa Soya (KES 75/kg)\n9️⃣ Makapi ma Bia (KES 15/kg)\n🔟 Mlo wa Thamaki (KES 120/kg)\n\nMAJANI:\n11️⃣ Majani ma Napier Fresh (KES 5/kg)\n12️⃣ Majani ma Napier Silage (KES 8/kg)\n13️⃣ Majani ma Mûbî (KES 3/kg)\n14️⃣ Majani ma Rhodes (KES 10/kg)\n15️⃣ Majani ma Lucerne (KES 35/kg)\n\nIRIO RIA GÛCINIA:\n16️⃣ Dairy Meal 18% (KES 55/kg)\n17️⃣ Dairy Meal 24% (KES 65/kg)\n\nMADINI:\n18️⃣ Mawe ma Chokaa (KES 15/kg)\n19️⃣ Dicalcium Phosphate (KES 80/kg)\n20️⃣ Chumvi ya Madini (KES 50/kg)\n21️⃣ Chumvi (KES 20/kg)\n\nGîcûnio: Ikara majani 1 + irio ria proteini 1.",
         'ration_optimal': "✅ Irio Rîaku Rîtheru (NRC 2001)",
@@ -202,11 +291,22 @@ MESSAGES = {
         'kg_day': "kg/mûthenya",
         'kes_day': "KES",
         'notes_header': "MAELEZO:",
+        'supplier_header': "💼 ARÎA MEKûGûRA HûGûRû:",
+        'no_supplier': "Gûtîrî arîa mekûgûra. Rîria agrovet yaku.",
+        'order_prompt': "\n📦 Cokeria ORDER kûgûra irio kuuma kûrîa mekûgûra.",
+        'order_instructions': "Cokeria na kîgîrô kîranî: 1:5,2:3\n(Maana yake kg 5 cia irio #1 na kg 3 cia irio #2)",
+        'order_invalid': "❌ Kîgîrô gîtarî kûrîa. Tumia: 1:5,2:3 (namba_irio:kg)",
+        'order_summary': "📦 MûTHONDO WA ORDER\n\n{items}\nJumla: *KES {total}*\n\nCokeria na namba yaku ya M-Pesa kûrîha.",
+        'payment_prompt': "📲 Ikera namba ya M-Pesa (kûranî 254712345678):",
+        'payment_initiated': "✅ M-Pesa prompt nîyatumîtwo kûrî {phone}.\nIkera PIN cîaku.",
+        'payment_failed': "❌ Kûrîha kûgîa gûtîrî: {reason}\nGeria rîngî kana ûrîhe mûgûrî mûciî.",
+        'payment_success': "✅ Kûrîha kwîmûkîrîrwo!\nMûgûrî {supplier} arîkûhûthia kûrî {phone}.",
+        'mpesa_not_configured': "⚠️ M-Pesa ndîrî na cîgerio.\nHîa mûgûrî mûciî: {phone}",
     }
 }
 
 def get_msg(phone, key, **kwargs):
-    """Get translated message for a user. Native first, AI fallback if enabled."""
+    """Get translated message. Native first, AI fallback if enabled."""
     lang = user_sessions.get(phone, {}).get('lang', 'en')
     text = MESSAGES.get(lang, MESSAGES['en']).get(key, MESSAGES['en'][key])
     if kwargs:
@@ -214,7 +314,6 @@ def get_msg(phone, key, **kwargs):
             text = text.format(**kwargs)
         except Exception:
             pass
-    # If the message is missing from native dict (and not English), try AI translation
     if lang != 'en' and text == MESSAGES['en'].get(key, text) and OPENAI_API_KEY:
         ai_text = ai_translate(text, lang)
         if ai_text:
@@ -705,6 +804,94 @@ def detect_feeds_from_image(image_url):
 
 
 # ============================================================
+# M-PESA DARAJA INTEGRATION
+# ============================================================
+def get_mpesa_access_token():
+    """Get M-Pesa access token from Daraja API."""
+    if not MPESA_CONSUMER_KEY or not MPESA_CONSUMER_SECRET:
+        return None
+    try:
+        url = "https://sandbox.safaricom.co.ke/oauth/v1/generate?grant_type=client_credentials"
+        if MPESA_ENV == "production":
+            url = "https://api.safaricom.co.ke/oauth/v1/generate?grant_type=client_credentials"
+        resp = requests.get(url, auth=(MPESA_CONSUMER_KEY, MPESA_CONSUMER_SECRET), timeout=10)
+        data = resp.json()
+        return data.get('access_token')
+    except Exception:
+        return None
+
+def initiate_stk_push(phone, amount, account_ref, callback_url):
+    """Initiate M-Pesa STK Push to farmer's phone."""
+    token = get_mpesa_access_token()
+    if not token:
+        return None, "M-Pesa credentials not configured"
+
+    try:
+        timestamp = datetime.now().strftime('%Y%m%d%H%M%S')
+        password_str = f"{MPESA_SHORTCODE}{MPESA_PASSKEY}{timestamp}"
+        password = base64.b64encode(password_str.encode()).decode()
+
+        url = "https://sandbox.safaricom.co.ke/mpesa/stkpush/v1/processrequest"
+        if MPESA_ENV == "production":
+            url = "https://api.safaricom.co.ke/mpesa/stkpush/v1/processrequest"
+
+        payload = {
+            "BusinessShortCode": MPESA_SHORTCODE,
+            "Password": password,
+            "Timestamp": timestamp,
+            "TransactionType": "CustomerPayBillOnline",
+            "Amount": int(amount),
+            "PartyA": phone,
+            "PartyB": MPESA_SHORTCODE,
+            "PhoneNumber": phone,
+            "CallBackURL": callback_url,
+            "AccountReference": account_ref[:12],
+            "TransactionDesc": "BalancedBora Feed"
+        }
+
+        headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
+        resp = requests.post(url, json=payload, headers=headers, timeout=15)
+        data = resp.json()
+
+        if data.get("ResponseCode") == "0":
+            return data.get("CheckoutRequestID"), None
+        else:
+            return None, data.get("ResponseDescription", "Unknown M-Pesa error")
+    except Exception as e:
+        return None, str(e)
+
+
+# ============================================================
+# SUPPLIER FORMATTING
+# ============================================================
+def format_suppliers(phone, ration):
+    """Format supplier contacts for the ration ingredients."""
+    m = lambda k, **kw: get_msg(phone, k, **kw)
+    region = user_sessions.get(phone, {}).get('region')
+
+    lines = [f"\n*{m('supplier_header')}*"]
+
+    for item in ration:
+        feed_id = item['id']
+        suppliers = SUPPLIERS_DB.get(feed_id, [])
+
+        if region and suppliers:
+            local = [s for s in suppliers if s['region'] == region]
+            others = [s for s in suppliers if s['region'] != region]
+            suppliers = local + others
+
+        if suppliers:
+            lines.append(f"\n*{item['name']}:*")
+            for i, s in enumerate(suppliers[:2], 1):
+                lines.append(f"{i}. {s['name']} 📞 {s['phone']} ({s['region']}, KES {s['price']}/kg)")
+        else:
+            lines.append(f"\n*{item['name']}:* {m('no_supplier')}")
+
+    lines.append(f"\n{m('order_prompt')}")
+    return "\n".join(lines)
+
+
+# ============================================================
 # MESSAGE BUILDERS
 # ============================================================
 def format_ration(phone, result):
@@ -734,8 +921,298 @@ def format_ration(phone, result):
                 msg += m(warn_key, **warn_kwargs) + "\n"
 
     msg += f"\n{m('start_again')}"
+
+    # ADD SUPPLIERS
+    msg += format_suppliers(phone, result['ration'])
+
     return msg
 
+# ============================================================
+# ADMIN DASHBOARD
+# ============================================================
+ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "balancedbora2024")
+
+@app.get("/admin", response_class=HTMLResponse)
+def admin_dashboard():
+    html = """
+    <!DOCTYPE html>
+    <html>
+    <head>
+        <title>BalancedBora Admin</title>
+        <meta name="viewport" content="width=device-width, initial-scale=1">
+        <style>
+            body { font-family: Arial, sans-serif; max-width: 900px; margin: 0 auto; padding: 20px; background: #f5f5f5; }
+            h1 { color: #2c5530; }
+            .card { background: white; padding: 20px; margin: 15px 0; border-radius: 8px; box-shadow: 0 2px 4px rgba(0,0,0,0.1); }
+            table { width: 100%; border-collapse: collapse; margin-top: 10px; }
+            th, td { text-align: left; padding: 10px; border-bottom: 1px solid #ddd; }
+            th { background: #2c5530; color: white; }
+            tr:hover { background: #f9f9f9; }
+            input, select { padding: 8px; margin: 5px 0; width: 100%; box-sizing: border-box; }
+            button { background: #2c5530; color: white; padding: 10px 20px; border: none; border-radius: 4px; cursor: pointer; }
+            button:hover { background: #1e3d21; }
+            .delete-btn { background: #c0392b; }
+            .delete-btn:hover { background: #a93226; }
+            .nav { margin-bottom: 20px; }
+            .nav a { color: #2c5530; text-decoration: none; margin-right: 15px; font-weight: bold; }
+            .stats { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 15px; }
+            .stat-box { background: #2c5530; color: white; padding: 15px; border-radius: 8px; text-align: center; }
+            .stat-box h3 { margin: 0; font-size: 2em; }
+            .stat-box p { margin: 5px 0 0; opacity: 0.9; }
+        </style>
+    </head>
+    <body>
+        <h1>🐄 BalancedBora Admin Dashboard</h1>
+        <div class="nav">
+            <a href="/admin">Dashboard</a>
+            <a href="/admin/suppliers">Suppliers</a>
+            <a href="/admin/add-supplier">Add Supplier</a>
+            <a href="/admin/orders">Orders</a>
+        </div>
+        <div class="stats">
+            <div class="stat-box"><h3>""" + str(len(SUPPLIERS_DB)) + """</h3><p>Feed Types with Suppliers</p></div>
+            <div class="stat-box"><h3>""" + str(sum(len(v) for v in SUPPLIERS_DB.values())) + """</h3><p>Total Suppliers</p></div>
+            <div class="stat-box"><h3>""" + str(len(user_sessions)) + """</h3><p>Active Sessions</p></div>
+            <div class="stat-box"><h3>""" + str(len(orders_db)) + """</h3><p>Total Orders</p></div>
+        </div>
+        <div class="card">
+            <h2>Quick Actions</h2>
+            <p><a href="/admin/suppliers"><button>Manage Suppliers</button></a></p>
+            <p><a href="/admin/add-supplier"><button>Add New Supplier</button></a></p>
+        </div>
+    </body>
+    </html>
+    """
+    return html
+
+@app.get("/admin/suppliers", response_class=HTMLResponse)
+def admin_suppliers():
+    rows = ""
+    for feed_id, suppliers in SUPPLIERS_DB.items():
+        feed_name = FEEDS_DB.get(feed_id, {}).get('name', feed_id)
+        for s in suppliers:
+            rows += f"""
+            <tr>
+                <td>{feed_name}</td>
+                <td>{s['name']}</td>
+                <td>{s['phone']}</td>
+                <td>{s['region']}</td>
+                <td>KES {s['price']}</td>
+                <td>
+                    <form method="post" action="/admin/delete-supplier" style="display:inline;">
+                        <input type="hidden" name="feed_id" value="{feed_id}">
+                        <input type="hidden" name="supplier_id" value="{s['id']}">
+                        <button type="submit" class="delete-btn" onclick="return confirm('Delete this supplier?')">Delete</button>
+                    </form>
+                </td>
+            </tr>
+            """
+
+    html = """
+    <!DOCTYPE html>
+    <html>
+    <head>
+        <title>Suppliers - BalancedBora</title>
+        <meta name="viewport" content="width=device-width, initial-scale=1">
+        <style>
+            body { font-family: Arial, sans-serif; max-width: 900px; margin: 0 auto; padding: 20px; background: #f5f5f5; }
+            h1 { color: #2c5530; }
+            .card { background: white; padding: 20px; margin: 15px 0; border-radius: 8px; box-shadow: 0 2px 4px rgba(0,0,0,0.1); }
+            table { width: 100%; border-collapse: collapse; margin-top: 10px; }
+            th, td { text-align: left; padding: 10px; border-bottom: 1px solid #ddd; }
+            th { background: #2c5530; color: white; }
+            tr:hover { background: #f9f9f9; }
+            button { background: #2c5530; color: white; padding: 10px 20px; border: none; border-radius: 4px; cursor: pointer; }
+            .delete-btn { background: #c0392b; padding: 5px 10px; }
+            .nav { margin-bottom: 20px; }
+            .nav a { color: #2c5530; text-decoration: none; margin-right: 15px; font-weight: bold; }
+        </style>
+    </head>
+    <body>
+        <h1>🐄 Suppliers</h1>
+        <div class="nav">
+            <a href="/admin">Dashboard</a>
+            <a href="/admin/suppliers">Suppliers</a>
+            <a href="/admin/add-supplier">Add Supplier</a>
+            <a href="/admin/orders">Orders</a>
+        </div>
+        <div class="card">
+            <h2>All Registered Suppliers</h2>
+            <table>
+                <tr><th>Feed</th><th>Name</th><th>Phone</th><th>Region</th><th>Price</th><th>Action</th></tr>
+                """ + rows + """
+            </table>
+        </div>
+    </body>
+    </html>
+    """
+    return html
+
+@app.get("/admin/add-supplier", response_class=HTMLResponse)
+def admin_add_supplier_form():
+    feed_options = ""
+    for num, fid in FEED_NUMBER_MAP.items():
+        name = FEEDS_DB.get(fid, {}).get('name', fid)
+        feed_options += f'<option value="{fid}">{num}. {name}</option>'
+
+    region_options = ""
+    for num, reg in REGIONS.items():
+        region_options += f'<option value="{reg}">{reg}</option>'
+
+    html = """
+    <!DOCTYPE html>
+    <html>
+    <head>
+        <title>Add Supplier - BalancedBora</title>
+        <meta name="viewport" content="width=device-width, initial-scale=1">
+        <style>
+            body { font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto; padding: 20px; background: #f5f5f5; }
+            h1 { color: #2c5530; }
+            .card { background: white; padding: 20px; margin: 15px 0; border-radius: 8px; box-shadow: 0 2px 4px rgba(0,0,0,0.1); }
+            input, select { padding: 10px; margin: 8px 0; width: 100%; box-sizing: border-box; border: 1px solid #ddd; border-radius: 4px; }
+            button { background: #2c5530; color: white; padding: 12px 20px; border: none; border-radius: 4px; cursor: pointer; font-size: 16px; }
+            button:hover { background: #1e3d21; }
+            .nav { margin-bottom: 20px; }
+            .nav a { color: #2c5530; text-decoration: none; margin-right: 15px; font-weight: bold; }
+            label { font-weight: bold; color: #333; }
+        </style>
+    </head>
+    <body>
+        <h1>🐄 Add New Supplier</h1>
+        <div class="nav">
+            <a href="/admin">Dashboard</a>
+            <a href="/admin/suppliers">Suppliers</a>
+            <a href="/admin/add-supplier">Add Supplier</a>
+            <a href="/admin/orders">Orders</a>
+        </div>
+        <div class="card">
+            <form method="post" action="/admin/add-supplier">
+                <label>Feed Type</label>
+                <select name="feed_id" required>""" + feed_options + """</select>
+
+                <label>Supplier Name</label>
+                <input type="text" name="name" placeholder="e.g. Central Feeds Ltd" required>
+
+                <label>Phone Number</label>
+                <input type="text" name="phone" placeholder="+254712345678" required>
+
+                <label>Region</label>
+                <select name="region" required>""" + region_options + """</select>
+
+                <label>Price per kg (KES)</label>
+                <input type="number" name="price" placeholder="25" required>
+
+                <button type="submit">Add Supplier</button>
+            </form>
+        </div>
+    </body>
+    </html>
+    """
+    return html
+
+@app.post("/admin/add-supplier")
+def admin_add_supplier_post(
+    feed_id: str = Form(...),
+    name: str = Form(...),
+    phone: str = Form(...),
+    region: str = Form(...),
+    price: int = Form(...)
+):
+    import uuid
+    supplier = {
+        "id": f"sup_{uuid.uuid4().hex[:8]}",
+        "name": name,
+        "phone": phone,
+        "region": region,
+        "price": price
+    }
+    if feed_id not in SUPPLIERS_DB:
+        SUPPLIERS_DB[feed_id] = []
+    SUPPLIERS_DB[feed_id].append(supplier)
+    save_suppliers(SUPPLIERS_DB)
+
+    return HTMLResponse(content="""
+    <!DOCTYPE html>
+    <html><head><meta http-equiv="refresh" content="2;url=/admin/suppliers"></head>
+    <body style="font-family:Arial; text-align:center; padding:50px;">
+        <h2 style="color:#2c5530;">✅ Supplier Added Successfully!</h2>
+        <p>Redirecting to suppliers list...</p>
+    </body></html>
+    """)
+
+@app.post("/admin/delete-supplier")
+def admin_delete_supplier(feed_id: str = Form(...), supplier_id: str = Form(...)):
+    if feed_id in SUPPLIERS_DB:
+        SUPPLIERS_DB[feed_id] = [s for s in SUPPLIERS_DB[feed_id] if s['id'] != supplier_id]
+        if not SUPPLIERS_DB[feed_id]:
+            del SUPPLIERS_DB[feed_id]
+        save_suppliers(SUPPLIERS_DB)
+
+    return HTMLResponse(content="""
+    <!DOCTYPE html>
+    <html><head><meta http-equiv="refresh" content="2;url=/admin/suppliers"></head>
+    <body style="font-family:Arial; text-align:center; padding:50px;">
+        <h2 style="color:#c0392b;">🗑️ Supplier Deleted</h2>
+        <p>Redirecting to suppliers list...</p>
+    </body></html>
+    """)
+
+@app.get("/admin/orders", response_class=HTMLResponse)
+def admin_orders():
+    rows = ""
+    for phone, orders in orders_db.items():
+        for order in orders:
+            items = "<br>".join([f"{it['name']}: {it['kg']}kg @ KES {it['price']}/kg" for it in order.get('items', [])])
+            status_color = "#2c5530" if order.get('paid') else "#e67e22"
+            status_text = "PAID" if order.get('paid') else "PENDING"
+            rows += f"""
+            <tr>
+                <td>{phone}</td>
+                <td>{items}</td>
+                <td>KES {order.get('total', 0)}</td>
+                <td style="color:{status_color}; font-weight:bold;">{status_text}</td>
+                <td>{order.get('supplier_phone', 'N/A')}</td>
+                <td>{order.get('timestamp', 'N/A')}</td>
+            </tr>
+            """
+
+    html = """
+    <!DOCTYPE html>
+    <html>
+    <head>
+        <title>Orders - BalancedBora</title>
+        <meta name="viewport" content="width=device-width, initial-scale=1">
+        <style>
+            body { font-family: Arial, sans-serif; max-width: 1000px; margin: 0 auto; padding: 20px; background: #f5f5f5; }
+            h1 { color: #2c5530; }
+            .card { background: white; padding: 20px; margin: 15px 0; border-radius: 8px; box-shadow: 0 2px 4px rgba(0,0,0,0.1); }
+            table { width: 100%; border-collapse: collapse; margin-top: 10px; }
+            th, td { text-align: left; padding: 10px; border-bottom: 1px solid #ddd; }
+            th { background: #2c5530; color: white; }
+            tr:hover { background: #f9f9f9; }
+            .nav { margin-bottom: 20px; }
+            .nav a { color: #2c5530; text-decoration: none; margin-right: 15px; font-weight: bold; }
+        </style>
+    </head>
+    <body>
+        <h1>🐄 Orders</h1>
+        <div class="nav">
+            <a href="/admin">Dashboard</a>
+            <a href="/admin/suppliers">Suppliers</a>
+            <a href="/admin/add-supplier">Add Supplier</a>
+            <a href="/admin/orders">Orders</a>
+        </div>
+        <div class="card">
+            <h2>All Orders</h2>
+            <table>
+                <tr><th>Farmer</th><th>Items</th><th>Total</th><th>Status</th><th>Supplier</th><th>Time</th></tr>
+                """ + (rows if rows else "<tr><td colspan='6' style='text-align:center;'>No orders yet</td></tr>") + """
+            </table>
+        </div>
+    </body>
+    </html>
+    """
+    return html
 
 # ============================================================
 # WEBHOOK
@@ -788,7 +1265,10 @@ async def whatsapp_webhook(
         session['step'] = -1
         session['profile'] = None
         session['feeds'] = None
+        session['region'] = None
+        session['last_ration'] = None
         session.pop('ai_detected_feeds', None)
+        session.pop('order_items', None)
         msg.body(get_msg(phone, 'choose_language'))
         return Response(content=str(resp), media_type="application/xml")
 
@@ -796,10 +1276,24 @@ async def whatsapp_webhook(
     if session['step'] == -1:
         if text in LANG_MAP:
             session['lang'] = LANG_MAP[text]
+            session['step'] = 0
+            msg.body(get_msg(phone, 'choose_region'))
+        else:
+            msg.body(get_msg(phone, 'choose_language'))
+        return Response(content=str(resp), media_type="application/xml")
+
+    # REGION SELECTION (Step 0)
+    if session['step'] == 0:
+        if text in REGIONS:
+            session['region'] = REGIONS[text]
+            session['step'] = 1
+            msg.body(get_msg(phone, 'welcome') + "\n\n" + get_msg(phone, 'choose_animal'))
+        elif text == '0':
+            session['region'] = None
             session['step'] = 1
             msg.body(get_msg(phone, 'welcome') + "\n\n" + get_msg(phone, 'choose_animal'))
         else:
-            msg.body(get_msg(phone, 'choose_language'))
+            msg.body(get_msg(phone, 'choose_region'))
         return Response(content=str(resp), media_type="application/xml")
 
     # Confirm AI-detected feeds
@@ -823,12 +1317,13 @@ async def whatsapp_webhook(
                 msg.body("❌ " + str(error) + "\n\n" + get_msg(phone, 'start_again'))
             session['step'] = 0
         else:
+            session['last_ration'] = result
             msg.body(format_ration(phone, result))
-            session['step'] = 0
+            session['step'] = 3
         return Response(content=str(resp), media_type="application/xml")
 
     # Step 1: Select animal
-    if session['step'] == 0 or session['step'] == 1:
+    if session['step'] == 1:
         if text in ANIMAL_PROFILES:
             session['profile'] = text
             session['step'] = 2
@@ -862,9 +1357,147 @@ async def whatsapp_webhook(
                 msg.body("❌ " + str(error) + "\n\n" + get_msg(phone, 'start_again'))
             session['step'] = 0
         else:
+            session['last_ration'] = result
             msg.body(format_ration(phone, result))
-            session['step'] = 0
+            session['step'] = 3
 
+        return Response(content=str(resp), media_type="application/xml")
+
+    # Step 3: Order menu (after ration shown)
+    if session['step'] == 3:
+        if text == 'order':
+            ration = session.get('last_ration', {})
+            if not ration or not ration.get('ration'):
+                msg.body(get_msg(phone, 'generic_help'))
+                return Response(content=str(resp), media_type="application/xml")
+
+            # Build order menu
+            lines = [get_msg(phone, 'order_instructions') + "\n"]
+            for i, item in enumerate(ration['ration'], 1):
+                lines.append(f"{i}. {item['name']}")
+            msg.body("\n".join(lines))
+            session['step'] = 4
+            return Response(content=str(resp), media_type="application/xml")
+        else:
+            msg.body(get_msg(phone, 'generic_help'))
+            return Response(content=str(resp), media_type="application/xml")
+
+    # Step 4: Parse order quantities
+    if session['step'] == 4:
+        ration = session.get('last_ration', {})
+        if not ration or not ration.get('ration'):
+            msg.body(get_msg(phone, 'generic_help'))
+            session['step'] = 0
+            return Response(content=str(resp), media_type="application/xml")
+
+        try:
+            order_items = []
+            total = 0
+            parts = text.split(",")
+            for part in parts:
+                idx_qty = part.strip().split(":")
+                if len(idx_qty) != 2:
+                    raise ValueError("Invalid format")
+                idx = int(idx_qty[0].strip()) - 1
+                qty = float(idx_qty[1].strip())
+                if idx < 0 or idx >= len(ration['ration']):
+                    raise ValueError("Invalid feed number")
+
+                item = ration['ration'][idx]
+                feed_id = item['id']
+                # Get supplier price if available, else use default
+                suppliers = SUPPLIERS_DB.get(feed_id, [])
+                region = session.get('region')
+                price = item.get('cost_per_day', 0)  # fallback
+                supplier_phone = None
+                supplier_name = "Direct"
+
+                if suppliers:
+                    # Pick cheapest supplier in region, or cheapest overall
+                    if region:
+                        local = [s for s in suppliers if s['region'] == region]
+                        if local:
+                            supplier = min(local, key=lambda x: x['price'])
+                        else:
+                            supplier = min(suppliers, key=lambda x: x['price'])
+                    else:
+                        supplier = min(suppliers, key=lambda x: x['price'])
+                    price = supplier['price']
+                    supplier_phone = supplier['phone']
+                    supplier_name = supplier['name']
+
+                cost = qty * price
+                total += cost
+                order_items.append({
+                    'name': item['name'],
+                    'kg': qty,
+                    'price': price,
+                    'cost': cost,
+                    'supplier_name': supplier_name,
+                    'supplier_phone': supplier_phone,
+                    'feed_id': feed_id
+                })
+
+            session['order_items'] = order_items
+            session['order_total'] = total
+
+            items_str = "\n".join([f"• {it['name']}: {it['kg']}kg x KES {it['price']} = KES {it['cost']:.0f}" for it in order_items])
+            msg.body(get_msg(phone, 'order_summary', items=items_str, total=f"{total:.0f}"))
+            session['step'] = 5
+            return Response(content=str(resp), media_type="application/xml")
+
+        except Exception as e:
+            msg.body(get_msg(phone, 'order_invalid'))
+            return Response(content=str(resp), media_type="application/xml")
+
+    # Step 5: M-Pesa phone number
+    if session['step'] == 5:
+        mpesa_phone = text.strip()
+        if not mpesa_phone.startswith("254") or len(mpesa_phone) != 12:
+            msg.body(get_msg(phone, 'payment_prompt'))
+            return Response(content=str(resp), media_type="application/xml")
+
+        order_items = session.get('order_items', [])
+        total = session.get('order_total', 0)
+
+        if not MPESA_CONSUMER_KEY or not MPESA_PASSKEY or not BASE_URL:
+            # M-Pesa not configured — give supplier direct contact
+            supplier_phone = order_items[0].get('supplier_phone') if order_items else None
+            msg.body(get_msg(phone, 'mpesa_not_configured', phone=supplier_phone or "your local agrovet"))
+            session['step'] = 0
+            return Response(content=str(resp), media_type="application/xml")
+
+        # Initiate STK Push
+        callback = f"{BASE_URL}/mpesa/callback"
+        checkout_id, error = initiate_stk_push(mpesa_phone, total, f"BB{phone[-6:]}", callback)
+
+        if error:
+            msg.body(get_msg(phone, 'payment_failed', reason=str(error)))
+            session['step'] = 0
+            return Response(content=str(resp), media_type="application/xml")
+
+        # Save order pending payment
+        order = {
+            'items': order_items,
+            'total': total,
+            'phone': phone,
+            'mpesa_phone': mpesa_phone,
+            'checkout_id': checkout_id,
+            'paid': False,
+            'timestamp': datetime.now().isoformat()
+        }
+        if phone not in orders_db:
+            orders_db[phone] = []
+        orders_db[phone].append(order)
+        session['pending_checkout'] = checkout_id
+
+        msg.body(get_msg(phone, 'payment_initiated', phone=mpesa_phone))
+        session['step'] = 6
+        return Response(content=str(resp), media_type="application/xml")
+
+    # Step 6: Waiting for payment
+    if session['step'] == 6:
+        msg.body("⏳ Please check your phone and enter M-Pesa PIN.\nSend START to cancel.")
         return Response(content=str(resp), media_type="application/xml")
 
     msg.body(get_msg(phone, 'generic_help'))
@@ -872,22 +1505,52 @@ async def whatsapp_webhook(
 
 
 # ============================================================
-# HEALTH CHECK
+# M-PESA CALLBACK
 # ============================================================
-@app.get("/")
-def health_check():
-    return {
-        "status": "BalancedBora AI v2.6 is running 🐄",
-        "features": ["nrc_2001_lp", "best_effort_mode", "ai_suggestions", "image_recognition", "21_feeds", "native_translations", "optional_ai_translations"],
-        "vision_configured": bool(GOOGLE_API_KEY),
-        "ai_translation_configured": bool(OPENAI_API_KEY),
-        "sessions": len(user_sessions)
-    }
+@app.post("/mpesa/callback")
+async def mpesa_callback(request: Request):
+    try:
+        data = await request.json()
+        result_code = data.get('Body', {}).get('stkCallback', {}).get('ResultCode')
+        checkout_id = data.get('Body', {}).get('stkCallback', {}).get('CheckoutRequestID')
 
+        # Find order
+        for phone, orders in orders_db.items():
+            for order in orders:
+                if order.get('checkout_id') == checkout_id:
+                    if result_code == 0:
+                        order['paid'] = True
+                        # Notify farmer via Twilio
+                        if client:
+                            supplier = order['items'][0]['supplier_name'] if order['items'] else "Supplier"
+                            supplier_phone = order['items'][0]['supplier_phone'] if order['items'] else ""
+                            message = get_msg(phone, 'payment_success', supplier=supplier, phone=supplier_phone)
+                            try:
+                                client.messages.create(
+                                    from_=TWILIO_NUMBER,
+                                    to=f"whatsapp:{phone}",
+                                    body=message
+                                )
+                            except Exception:
+                                pass
+                        # Notify supplier
+                        if client and order['items']:
+                            sup_phone = order['items'][0].get('supplier_phone')
+                            if sup_phone:
+                                try:
+                                    farmer_order = "\n".join([f"{it['name']}: {it['kg']}kg" for it in order['items']])
+                                    client.messages.create(
+                                        from_=TWILIO_NUMBER,
+                                        to=f"whatsapp:{sup_phone}",
+                                        body=f"🐄 NEW ORDER from {phone}\n{farmer_order}\nTotal: KES {order['total']}\nPlease arrange delivery."
+                                    )
+                                except Exception:
+                                    pass
+                    else:
+                        order['paid'] = False
+                        order['failure_reason'] = data.get('Body', {}).get('stkCallback', {}).get('ResultDesc', 'Unknown')
+                    break
 
-# ============================================================
-# RUN
-# ============================================================
-if __name__ == "__main__":
-    import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+        return {"ResultCode": 0, "ResultDesc": "Accepted"}
+    except Exception:
+        return {"ResultCode": 0, "ResultDesc": "Accepted"}
