@@ -1,13 +1,15 @@
 # ============================================================
-# BALANCEDBORA — COMPLETE PRODUCTION BOT v2.5
+# BALANCEDBORA — COMPLETE PRODUCTION BOT v2.6
 # Features: NRC 2001 LP + Best-Effort Mode + 21 Feeds + Image
 # + Native Translations (English, Swahili, Kikuyu, Kimeru)
+# + Optional AI Translations (OpenAI)
 # NO API DEPENDENCY — works offline, instant, forever
 # ============================================================
 
 import os
 import requests
 import base64
+import traceback
 from fastapi import FastAPI, Form, Request
 from fastapi.responses import Response
 from fastapi.staticfiles import StaticFiles
@@ -29,6 +31,7 @@ TWILIO_SID = os.getenv("TWILIO_ACCOUNT_SID", "")
 TWILIO_TOKEN = os.getenv("TWILIO_AUTH_TOKEN", "")
 TWILIO_NUMBER = os.getenv("TWILIO_PHONE_NUMBER", "whatsapp:+254703709346")
 GOOGLE_API_KEY = os.getenv("GOOGLE_VISION_API_KEY", "")
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")  # Optional: enables AI translations
 
 client = Client(TWILIO_SID, TWILIO_TOKEN) if TWILIO_SID else None
 
@@ -38,12 +41,35 @@ client = Client(TWILIO_SID, TWILIO_TOKEN) if TWILIO_SID else None
 user_sessions = {}
 
 # ============================================================
+# OPTIONAL AI TRANSLATION ENGINE
+# ============================================================
+def ai_translate(text, target_lang):
+    """Translate text using OpenAI if API key is available. Otherwise return None."""
+    if not OPENAI_API_KEY:
+        return None
+    try:
+        import openai
+        lang_names = {'en': 'English', 'sw': 'Swahili', 'ki': 'Kikuyu', 'mer': 'Kimeru'}
+        target = lang_names.get(target_lang, target_lang)
+        resp = openai.OpenAI(api_key=OPENAI_API_KEY).chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[
+                {"role": "system", "content": f"You translate for Kenyan farmers. Translate to {target}. Keep it short, friendly, and use simple language. Return ONLY the translation."},
+                {"role": "user", "content": text}
+            ],
+            temperature=0.2,
+            max_tokens=600
+        )
+        return resp.choices[0].message.content.strip()
+    except Exception:
+        return None
+
+# ============================================================
 # NATIVE TRANSLATION SYSTEM — NO API NEEDED
 # ============================================================
 LANG_MAP = {'1': 'en', '2': 'sw', '3': 'ki', '4': 'mer'}
 LANG_NAME = {'en': 'English', 'sw': 'Kiswahili', 'ki': 'Kikuyu', 'mer': 'Kimeru'}
 
-# Every message pre-translated. Edit these if you want to improve wording.
 MESSAGES = {
     'en': {
         'welcome': "🐄 Welcome to BalancedBora!\n\nI calculate the cheapest balanced ration for your cow using NRC 2001 science.",
@@ -180,14 +206,19 @@ MESSAGES = {
 }
 
 def get_msg(phone, key, **kwargs):
-    """Get translated message for a user."""
+    """Get translated message for a user. Native first, AI fallback if enabled."""
     lang = user_sessions.get(phone, {}).get('lang', 'en')
     text = MESSAGES.get(lang, MESSAGES['en']).get(key, MESSAGES['en'][key])
     if kwargs:
         try:
             text = text.format(**kwargs)
-        except:
+        except Exception:
             pass
+    # If the message is missing from native dict (and not English), try AI translation
+    if lang != 'en' and text == MESSAGES['en'].get(key, text) and OPENAI_API_KEY:
+        ai_text = ai_translate(text, lang)
+        if ai_text:
+            return ai_text
     return text
 
 # ============================================================
@@ -407,26 +438,26 @@ class FeedSuggestionEngine:
         profile = self.profiles[profile_key]
         current_ids = set(current_feeds)
         candidates = []
-        
+
         for fid, data in self.feeds.items():
             if fid in current_ids:
                 continue
-            
+
             score = 0.0
             reasons = []
-            
+
             for nutrient in low_nutrients:
                 if nutrient in data and data[nutrient] > 0:
                     efficiency = data.get('efficiency', {}).get(nutrient, 0)
                     score += efficiency * 100
                     if efficiency > 0.3:
                         reasons.append(f"adds {nutrient.upper()}")
-            
+
             for nutrient in high_nutrients:
                 if nutrient in data and data[nutrient] < 5:
                     score += 50
                     reasons.append(f"low {nutrient.upper()}")
-            
+
             current_cats = {self.feeds[f]['category'] for f in current_ids if f in self.feeds}
             if data['category'] not in current_cats:
                 if data['category'] == 'protein':
@@ -441,14 +472,14 @@ class FeedSuggestionEngine:
                 elif data['category'] == 'energy':
                     score += 50
                     reasons.append("adds ENERGY")
-            
+
             if score > 0:
                 candidates.append({
                     'id': fid, 'name': data['name'], 'score': score,
                     'cost': data['cost_kg'], 'category': data['category'],
                     'reasons': reasons[:2], 'notes': data['notes']
                 })
-        
+
         candidates.sort(key=lambda x: x['score'], reverse=True)
         return candidates[:3]
 
@@ -607,7 +638,7 @@ def solve_nrc_ration(profile_key, selected_feeds):
 
     warnings = []
     if best_effort:
-        warnings.append(('best_effort', {}))
+        warnings.append(('best_effort_notice', {}))
         for n in low_nutrients:
             v = verification[n]
             warnings.append(('nutrient_low', {'nutrient': n.upper(), 'actual': f"{v['actual']:.1f}{v['unit']}", 'min': f"{v['min']:.1f}", 'max': f"{v['max']:.1f}"}))
@@ -615,11 +646,11 @@ def solve_nrc_ration(profile_key, selected_feeds):
             v = verification[n]
             warnings.append(('nutrient_high', {'nutrient': n.upper(), 'actual': f"{v['actual']:.1f}{v['unit']}", 'min': f"{v['min']:.1f}", 'max': f"{v['max']:.1f}"}))
         if not dairy_ok:
-            warnings.append(('nfc_ndf', {'nfc': f"{nfc_actual:.1f}", 'ndf': f"{ndf_actual:.1f}"}))
+            warnings.append(('nfc_ndf_warning', {'nfc': f"{nfc_actual:.1f}", 'ndf': f"{ndf_actual:.1f}"}))
 
         ai_sugs = suggestion_engine.suggest_for_fix(profile_key, selected_feeds, low_nutrients, high_nutrients)
         if ai_sugs:
-            warnings.append(('ai_header', {}))
+            warnings.append(('ai_suggestions', {}))
             for i, sug in enumerate(ai_sugs, 1):
                 num = ID_TO_NUMBER.get(sug['id'], '?')
                 reasons = ", ".join(sug['reasons']) if sug['reasons'] else "balanced"
@@ -774,16 +805,22 @@ async def whatsapp_webhook(
     # Confirm AI-detected feeds
     if session.get('step') == 2 and 'ai_detected_feeds' in session and text in ['yes', 'yep', 'sawa', 'correct', 'ndio', 'ii']:
         feed_ids = [FEED_NUMBER_MAP[n] for n in session['ai_detected_feeds'] if n in FEED_NUMBER_MAP]
-        result, error = solve_nrc_ration(session['profile'], feed_ids)
+        try:
+            result, error = solve_nrc_ration(session['profile'], feed_ids)
+        except Exception as e:
+            traceback.print_exc()
+            msg.body("❌ Something went wrong calculating your ration. Please try different feeds or send START to restart.")
+            session.pop('ai_detected_feeds', None)
+            session['step'] = 0
+            return Response(content=str(resp), media_type="application/xml")
         session.pop('ai_detected_feeds', None)
-        if error and isinstance(error, str) and error.startswith("❌"):
-            msg.body(error)
-            session['step'] = 0
-        elif error == "NO_FORAGE":
-            msg.body(get_msg(phone, 'no_forage_error'))
-            session['step'] = 0
-        elif error and isinstance(error, tuple) and error[0] == "IMPOSSIBLE_MINS":
-            msg.body(get_msg(phone, 'impossible_mins', total_min=error[1], offenders=', '.join(error[2])))
+        if error:
+            if error == "NO_FORAGE":
+                msg.body(get_msg(phone, 'no_forage_error'))
+            elif isinstance(error, tuple) and error[0] == "IMPOSSIBLE_MINS":
+                msg.body(get_msg(phone, 'impossible_mins', total_min=error[1], offenders=', '.join(error[2])))
+            else:
+                msg.body("❌ " + str(error) + "\n\n" + get_msg(phone, 'start_again'))
             session['step'] = 0
         else:
             msg.body(format_ration(phone, result))
@@ -808,16 +845,21 @@ async def whatsapp_webhook(
             return Response(content=str(resp), media_type="application/xml")
 
         feed_ids = [FEED_NUMBER_MAP[n] for n in selected_nums]
-        result, error = solve_nrc_ration(session['profile'], feed_ids)
+        try:
+            result, error = solve_nrc_ration(session['profile'], feed_ids)
+        except Exception as e:
+            traceback.print_exc()
+            msg.body("❌ Something went wrong calculating your ration. Please try different feeds or send START to restart.")
+            session['step'] = 0
+            return Response(content=str(resp), media_type="application/xml")
 
-        if error and isinstance(error, str) and error.startswith("❌"):
-            msg.body(error)
-            session['step'] = 0
-        elif error == "NO_FORAGE":
-            msg.body(get_msg(phone, 'no_forage_error'))
-            session['step'] = 0
-        elif error and isinstance(error, tuple) and error[0] == "IMPOSSIBLE_MINS":
-            msg.body(get_msg(phone, 'impossible_mins', total_min=error[1], offenders=', '.join(error[2])))
+        if error:
+            if error == "NO_FORAGE":
+                msg.body(get_msg(phone, 'no_forage_error'))
+            elif isinstance(error, tuple) and error[0] == "IMPOSSIBLE_MINS":
+                msg.body(get_msg(phone, 'impossible_mins', total_min=error[1], offenders=', '.join(error[2])))
+            else:
+                msg.body("❌ " + str(error) + "\n\n" + get_msg(phone, 'start_again'))
             session['step'] = 0
         else:
             msg.body(format_ration(phone, result))
@@ -835,9 +877,10 @@ async def whatsapp_webhook(
 @app.get("/")
 def health_check():
     return {
-        "status": "BalancedBora AI v2.5 is running 🐄",
-        "features": ["nrc_2001_lp", "best_effort_mode", "ai_suggestions", "image_recognition", "21_feeds", "native_translations"],
+        "status": "BalancedBora AI v2.6 is running 🐄",
+        "features": ["nrc_2001_lp", "best_effort_mode", "ai_suggestions", "image_recognition", "21_feeds", "native_translations", "optional_ai_translations"],
         "vision_configured": bool(GOOGLE_API_KEY),
+        "ai_translation_configured": bool(OPENAI_API_KEY),
         "sessions": len(user_sessions)
     }
 
