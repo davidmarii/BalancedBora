@@ -612,7 +612,7 @@ def solve_nrc_ration(profile_key, selected_feeds):
 
     warnings = []
     if best_effort:
-        warnings.append(('best_effort', {}))
+        warnings.append(('best_effort_notice', {}))
         for n in low_nutrients:
             v = verification[n]
             warnings.append(('nutrient_low', {'nutrient': n.upper(), 'actual': f"{v['actual']:.1f}{v['unit']}", 'min': f"{v['min']:.1f}", 'max': f"{v['max']:.1f}"}))
@@ -620,11 +620,11 @@ def solve_nrc_ration(profile_key, selected_feeds):
             v = verification[n]
             warnings.append(('nutrient_high', {'nutrient': n.upper(), 'actual': f"{v['actual']:.1f}{v['unit']}", 'min': f"{v['min']:.1f}", 'max': f"{v['max']:.1f}"}))
         if not dairy_ok:
-            warnings.append(('nfc_ndf', {'nfc': f"{nfc_actual:.1f}", 'ndf': f"{ndf_actual:.1f}"}))
+            warnings.append(('nfc_ndf_warning', {'nfc': f"{nfc_actual:.1f}", 'ndf': f"{ndf_actual:.1f}"}))
 
         ai_sugs = suggestion_engine.suggest_for_fix(profile_key, selected_feeds, low_nutrients, high_nutrients)
         if ai_sugs:
-            warnings.append(('ai_header', {}))
+            warnings.append(('ai_suggestions', {}))
             for i, sug in enumerate(ai_sugs, 1):
                 num = ID_TO_NUMBER.get(sug['id'], '?')
                 reasons = ", ".join(sug['reasons']) if sug['reasons'] else "balanced"
