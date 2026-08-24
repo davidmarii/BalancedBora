@@ -3,8 +3,9 @@ import Navbar from './components/Navbar'
 import Hero from './components/Hero'
 import Problem from './components/Problem'
 import Solution from './components/Solution'
+import Impact from './components/Impact'
 import Demo from './components/Demo'
-import Contact from './components/Contact'   {/* ? ADD THIS LINE */}
+import Contact from './components/Contact'
 import Footer from './components/Footer'
 
 function App() {
@@ -33,9 +34,9 @@ function App() {
       <Hero />
       <Problem />
       <Solution />
-	 <Impact /> 
+      <Impact />
       <Demo />
-      <Contact />   {/* ? ADD THIS LINE (right before Footer) */}
+      <Contact />
       <Footer />
     </div>
   )
