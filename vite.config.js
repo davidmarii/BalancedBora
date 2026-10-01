@@ -3,5 +3,5 @@ import react from '@vitejs/plugin-react'
 
 export default defineConfig({
   plugins: [react()],
-  base: '/BalancedBora/',  // ← Capital B, must match repo name
+  base: process.env.VITE_BASE_PATH || '/',
 })
